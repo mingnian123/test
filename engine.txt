@@ -1,0 +1,388 @@
+import torch
+from torch import nn
+from torch.utils.data import DataLoader
+from torch.optim import AdamW
+from torch.nn import CrossEntropyLoss
+from tqdm import tqdm
+from sklearn.metrics import confusion_matrix
+import os
+import random
+import numpy as np
+import matplotlib.pyplot as plt
+import torchvision.transforms.functional as F
+from config import Config
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from texture_utils import TextureExtractor
+def calculate_metrics(true_labels, pred_labels, num_classes):
+    """
+    计算指标：
+    - true_labels: 真实标签 [H, W]
+    - pred_labels: 预测标签 [H, W]
+    - num_classes: 类别数
+    返回: PA, MPA, F1, mIoU, FWIoU
+    """
+    valid_mask = (true_labels != -1)
+    true_labels = true_labels[valid_mask]
+    pred_labels = pred_labels[valid_mask]
+
+    # 计算混淆矩阵
+    cm = confusion_matrix(true_labels.flatten(), pred_labels.flatten(), labels=np.arange(num_classes))
+
+    # 计算 TP, FP, FN
+    TP = np.diag(cm)
+    FP = np.sum(cm, axis=0) - TP
+    FN = np.sum(cm, axis=1) - TP
+
+    # 计算指标
+    PA = np.sum(TP) / np.sum(cm)
+    MPA = np.mean(TP / (TP + FP + 1e-10))
+
+    # 计算每个类别的 IoU
+    IoU = TP / (TP + FP + FN + 1e-10)
+
+    # 只考虑实际出现的类别
+    present_classes = np.unique(true_labels)
+    present_classes = present_classes[present_classes < num_classes]  # 过滤无效标签
+    mIoU = np.mean(IoU[present_classes]) if len(present_classes) > 0 else 0.0
+
+    # 计算 F1 分数
+    Precision = TP / (TP + FP + 1e-10)
+    Recall = TP / (TP + FN + 1e-10)
+    F1 = 2 * (Precision * Recall) / (Precision + Recall + 1e-10)
+    F1_mean = np.mean(F1[present_classes]) if len(present_classes) > 0 else 0.0
+
+    # 计算频率加权 IoU
+    FWIoU = np.sum((np.sum(cm, axis=1) * IoU)) / np.sum(cm)
+
+    return PA, MPA, F1_mean, mIoU, FWIoU
+
+
+def train_stage1(cfg):
+    """
+    训练第一阶段模型（背景 vs 植被）
+    """
+    from models.stage1 import Stage1Segmenter
+    from datasets.dataset import GreenSpaceDataset
+
+    # 确保检查点目录存在
+    os.makedirs(cfg.CHECKPOINT_DIR, exist_ok=True)
+
+    # 初始化模型
+    model = Stage1Segmenter(cfg).to(cfg.DEVICE)
+    optimizer = AdamW(model.parameters(), lr=cfg.STAGE1["lr"])
+
+    criterion = CrossEntropyLoss()
+
+    # 数据集
+    train_dataset = GreenSpaceDataset(cfg.DATA_ROOT, is_train=True, stage=1)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=cfg.STAGE1["batch_size"],
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
+    )
+
+    # 验证集
+    val_dataset = GreenSpaceDataset(cfg.DATA_ROOT, is_train=False, stage=1)
+    val_loader = DataLoader(val_dataset, batch_size=cfg.STAGE1["batch_size"], shuffle=False)
+    scheduler = Config.get_scheduler(optimizer, stage=1)  # 添加这行
+    # 训练循环
+    best_mIoU = 0.0
+    for epoch in range(cfg.STAGE1["epochs"]):
+        model.train()
+        epoch_loss = 0.0
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{cfg.STAGE1['epochs']}")
+
+        # 可视化阶段一模型的输出（每个epoch随机选择一个batch和一张图像进行可视化）
+        random_batch_idx = random.randint(0, len(train_loader) - 1)
+        for batch_idx, (inputs, labels) in enumerate(progress_bar):
+            inputs = inputs[:, :4].to(cfg.DEVICE)
+            labels = (labels > 0).long().to(cfg.DEVICE)
+
+            # 前向传播
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            progress_bar.set_postfix({"Loss": f"{loss.item():.4f}"})
+
+            # 可视化
+            if batch_idx == random_batch_idx:
+                with torch.no_grad():
+                    pred = outputs.argmax(dim=1).squeeze().cpu().numpy()
+                    label = labels.squeeze().cpu().numpy()
+                    random_img_idx = random.randint(0, pred.shape[0] - 1)
+
+                    cmap = np.zeros((256, 3), dtype=np.uint8)
+                    cmap[0] = [0, 0, 0]  # 背景：黑色
+                    cmap[1] = [0, 255, 0]  # 植物区域：绿色
+
+                    plt.figure(figsize=(8, 4))
+                    plt.subplot(1, 2, 1)
+                    plt.title("Prediction")
+                    plt.imshow(cmap[pred[random_img_idx]])
+                    plt.axis('off')
+
+                    plt.subplot(1, 2, 2)
+                    plt.title("Ground Truth")
+                    plt.imshow(cmap[label[random_img_idx]])
+                    plt.axis('off')
+
+                    plt.legend(handles=[
+                        plt.Line2D([0], [0], marker='s', color='w', label='Background', markerfacecolor='k',
+                                   markersize=10),
+                        plt.Line2D([0], [0], marker='s', color='w', label='Vegetation', markerfacecolor='g',
+                                   markersize=10)
+                    ], loc='lower right')
+
+                    plt.savefig(f"stage1_epoch{epoch}_batch{batch_idx}_img{random_img_idx}.png", bbox_inches='tight')
+                    plt.close()
+        scheduler.step()
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch {epoch + 1} Learning Rate: {current_lr:.2e}")
+        # 验证集指标
+        model.eval()
+        all_true_labels = []
+        all_pred_labels = []
+        with torch.no_grad():
+            for inputs, labels in val_loader:
+                inputs = inputs[:, :4].to(cfg.DEVICE)
+                labels = labels.to(cfg.DEVICE)
+                outputs = model(inputs)
+                pred_labels = outputs.argmax(dim=1)
+                all_true_labels.append(labels.cpu().numpy())
+                all_pred_labels.append(pred_labels.cpu().numpy())
+
+        # 计算指标
+        true_labels = np.concatenate(all_true_labels)
+        pred_labels = np.concatenate(all_pred_labels)
+        PA, MPA, F1, mIoU, FWIoU = calculate_metrics(true_labels, pred_labels, cfg.STAGE1["num_classes"])
+
+        print(f"Epoch {epoch + 1} Metrics: PA={PA:.4f}, MPA={MPA:.4f}, F1={F1:.4f}, mIoU={mIoU:.4f}, FWIoU={FWIoU:.4f}")
+
+        # 保存最佳模型
+        if mIoU > best_mIoU:
+            best_mIoU = mIoU
+            torch.save(model.state_dict(), os.path.join(cfg.CHECKPOINT_DIR, "stage1_best.pth"))
+            print(f"Best model saved at epoch {epoch + 1} with mIoU={mIoU:.4f}")
+
+
+class CombinedLoss(nn.Module):
+    def __init__(self, alpha=0.7):
+        super().__init__()
+        # 第二阶段实际类别权重（背景:55% -> 0, 绿地:5% ->1, 其他植被:40% ->2）
+        ce_weights = torch.tensor([1 / 0.55, 1 / 0.05, 1 / 0.40], dtype=torch.float32)  # 反频率权重
+        ce_weights = ce_weights / ce_weights.sum()  # 归一化为[0.34, 3.81, 0.43]
+        self.ce = CrossEntropyLoss(
+            weight=ce_weights.to(Config.DEVICE),  # 确保权重在正确设备
+            ignore_index=-1
+        )
+
+        # Dice Loss增强配置（只作用于植被类）
+        self.dice_weights = torch.tensor([0.0, 3.0, 0.5], dtype=torch.float32)  # 背景不计算，绿地权重最高
+        self.alpha = alpha
+
+    def forward(self, pred, target):
+        ce_loss = self.ce(pred, target)  # 加权交叉熵
+
+        # 改进的植被类Dice Loss
+        pred_probs = torch.softmax(pred, dim=1)
+        dice_loss = 0.0
+        for cls in [1, 2]:  # 只计算绿地(1)和其他植被(2)
+            pred_cls = pred_probs[:, cls]  # [B,H,W]
+            target_cls = (target == cls).float()  # [B,H,W]
+
+            intersection = (pred_cls * target_cls).sum()
+            union = pred_cls.sum() + target_cls.sum()
+            dice_loss += self.dice_weights[cls] * (1 - (2 * intersection) / (union + 1e-6))
+
+        return ce_loss + self.alpha * dice_loss / 2.0  # 除以类别数平衡梯度
+def train_stage2(cfg, stage1_model):
+    """
+    训练第二阶段模型（背景 vs 绿地 vs 其他植被）
+    """
+    from models.stage2 import Stage2Segmenter
+    from datasets.dataset import GreenSpaceDataset
+
+    # 初始化阶段二模型
+    model = Stage2Segmenter(cfg).to(cfg.DEVICE)
+    optimizer = AdamW(model.parameters(), lr=cfg.STAGE2["lr"])
+    criterion = CombinedLoss(alpha=0.7).to(cfg.DEVICE)
+
+    # 数据集
+    train_dataset = GreenSpaceDataset(cfg.DATA_ROOT, is_train=True, stage=2)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=cfg.STAGE2["batch_size"],
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
+    )
+
+    # 验证集
+    val_dataset = GreenSpaceDataset(cfg.DATA_ROOT, is_train=False, stage=2)
+    val_loader = DataLoader(val_dataset, batch_size=cfg.STAGE2["batch_size"], shuffle=False)
+    scheduler = Config.get_scheduler(optimizer, stage=1)  # 添加这行
+
+    # 训练循环
+    best_mIoU = 0.0
+    for epoch in range(cfg.STAGE2["epochs"]):
+        model.train()
+        epoch_loss = 0.0
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{cfg.STAGE2['epochs']}")
+        random_batch_idx = random.randint(0, len(train_loader) - 1)
+        for batch_idx, (inputs, labels) in enumerate(progress_bar):
+            # 确保数据在正确设备
+            inputs = inputs.to(cfg.DEVICE)  # [B,4,H,W]
+            labels = labels.to(cfg.DEVICE)
+
+            # 计算NDVI
+            nir = inputs[:, 3, :, :]  # 第4通道是NIR
+            red = inputs[:, 2, :, :]  # 第3通道是Red
+            ndvi = (nir - red) / (nir + red + 1e-6)  # [B,H,W]
+
+            # 阶段一推理
+            with torch.no_grad():
+                stage1_probs = torch.softmax(stage1_model(inputs[:, :3]), dim=1)  # [B,2,H,W]
+
+                nir_np = inputs[:, 3].cpu().numpy().clip(0, 1)
+                lbp = torch.from_numpy(np.stack(
+                    [TextureExtractor.get_lbp(x) for x in nir_np]
+                )).float().unsqueeze(1).to(cfg.DEVICE)  # [B,1,H,W]
+
+            # 拼接所有特征（确保所有张量在相同设备）
+            stage2_input = torch.cat([
+                inputs,  # [B,4,H,W]
+                ndvi.unsqueeze(1),  # [B,1,H,W]
+                stage1_probs,  # [B,2,H,W]
+                lbp  # [B,1,H,W]
+            ], dim=1)  # -> [B,8,H,W]
+
+            optimizer.zero_grad()
+            outputs = model(stage2_input)
+
+            # 调整输出尺寸
+            if outputs.shape[-2:] != labels.shape[-2:]:
+                outputs = F.interpolate(outputs, size=labels.shape[-2:], mode="bilinear", align_corners=False)
+
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            progress_bar.set_postfix({"Loss": f"{loss.item():.4f}"})
+
+            # 可视化
+            if batch_idx == random_batch_idx:
+                with torch.no_grad():
+                    pred = outputs.argmax(dim=1).squeeze().cpu().numpy()
+                    label = labels.squeeze().cpu().numpy()
+                    random_img_idx = random.randint(0, pred.shape[0] - 1)
+
+                    cmap = np.zeros((256, 3), dtype=np.uint8)
+                    cmap[0] = [0, 0, 0]  # 背景：黑色
+                    cmap[1] = [0, 255, 0]  # 绿地：浅绿色
+                    cmap[2] = [0, 128, 0]  # 其他植被：深绿色
+
+                    plt.figure(figsize=(8, 4))
+                    plt.subplot(1, 2, 1)
+                    plt.title("Prediction")
+                    plt.imshow(cmap[pred[random_img_idx]])
+                    plt.axis('off')
+
+                    plt.subplot(1, 2, 2)
+                    plt.title("Ground Truth")
+                    plt.imshow(cmap[label[random_img_idx]])
+                    plt.axis('off')
+
+                    plt.legend(handles=[
+                        plt.Line2D([0], [0], marker='s', color='w', label='Background', markerfacecolor='k',
+                                   markersize=10),
+                        plt.Line2D([0], [0], marker='s', color='w', label='Green Space', markerfacecolor='g',
+                                   markersize=10),
+                        plt.Line2D([0], [0], marker='s', color='w', label='Other Vegetation',
+                                   markerfacecolor='darkgreen', markersize=10)
+                    ], loc='lower right')
+
+                    plt.savefig(f"stage2_epoch{epoch}_batch{batch_idx}_img{random_img_idx}.png", bbox_inches='tight')
+                    plt.close()
+        scheduler.step()
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch {epoch + 1} Learning Rate: {current_lr:.2e}")
+        # 验证集指标
+        model.eval()
+        all_true_labels = []
+        all_pred_labels = []
+        with torch.no_grad():
+            for inputs, labels in val_loader:
+                inputs = inputs.to(cfg.DEVICE)
+
+                # 计算NDVI
+                nir = inputs[:, 3, :, :]
+                red = inputs[:, 2, :, :]
+                ndvi = (nir - red) / (nir + red + 1e-6)
+
+                # 阶段一推理
+                stage1_probs = torch.softmax(stage1_model(inputs[:, :3]), dim=1)
+
+                # 纹理特征
+                nir_np = inputs[:, 3].cpu().numpy().clip(0, 1)
+                lbp = torch.from_numpy(np.stack(
+                    [TextureExtractor.get_lbp(x) for x in nir_np]
+                )).float().unsqueeze(1).to(cfg.DEVICE)  # [B,1,H,W]
+
+                # 输入拼接调整为8通道
+                stage2_input = torch.cat([
+                    inputs,  # [B,4,H,W]
+                    ndvi.unsqueeze(1),  # [B,1,H,W]
+                    stage1_probs,  # [B,2,H,W]
+                    lbp  # [B,1,H,W]
+                ], dim=1)  # -> [B,8,H,W]
+                outputs = model(stage2_input)
+                # 确保输出尺寸匹配标签
+                if outputs.shape[-2:] != labels.shape[-2:]:
+                    outputs = F.interpolate(outputs, size=labels.shape[-2:], mode="bilinear", align_corners=False)
+                pred_labels = outputs.argmax(dim=1)  # 此时 pred_labels 和 labels 尺寸一致
+
+                all_true_labels.append(labels.cpu().numpy())
+                all_pred_labels.append(pred_labels.cpu().numpy())
+
+        # 计算指标
+        true_labels = np.concatenate(all_true_labels)
+        pred_labels = np.concatenate(all_pred_labels)
+        PA, MPA, F1, mIoU, FWIoU = calculate_metrics(true_labels, pred_labels, cfg.STAGE2["num_classes"])
+
+        print(f"Epoch {epoch + 1} Metrics: PA={PA:.4f}, MPA={MPA:.4f}, F1={F1:.4f}, mIoU={mIoU:.4f}, FWIoU={FWIoU:.4f}")
+
+        # 保存最佳模型
+        if mIoU > best_mIoU:
+            best_mIoU = mIoU
+            torch.save(model.state_dict(), os.path.join(cfg.CHECKPOINT_DIR, "stage2_best.pth"))
+            print(f"Best model saved at epoch {epoch + 1} with mIoU={mIoU:.4f}")
+
+
+def merge_predictions(stage1_output, stage2_output):
+    """
+    合并两阶段结果：
+    - stage1_output: [B, 2, H, W]，背景和植被的概率图。
+    - stage2_output: [B, 3, H, W]，背景、绿地和其他植被的概率图。
+    返回: [B, H, W]，最终的三类分割结果（0=背景，1=绿地，2=其他植被）。
+    """
+    # 阶段一：确定植被区域
+    vegetation_mask = (stage1_output.argmax(dim=1) == 1)  # 植被区域为True，背景为False
+
+    # 阶段二：获取细分结果（直接使用3类输出）
+    stage2_pred = stage2_output.argmax(dim=1)
+
+    # 合并结果：背景区域使用阶段一的背景预测，植被区域使用阶段二的细分
+    final_pred = torch.where(
+        vegetation_mask,
+        stage2_pred,  # 植被区域使用阶段二的预测（1或2）
+        torch.zeros_like(stage2_pred)  # 背景区域设为0
+    )
+
+    return final_pred
