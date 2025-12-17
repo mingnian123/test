@@ -1,0 +1,13 @@
+import cv2
+import numpy as np
+from skimage.feature import graycomatrix, graycoprops, local_binary_pattern
+
+
+class TextureExtractor:
+
+    @staticmethod
+    def get_lbp(img_gray):
+        """计算LBP特征"""
+        img_uint8 = (img_gray * 255).clip(0, 255).astype(np.uint8)
+        lbp = local_binary_pattern(img_uint8, P=8, R=1, method='uniform')
+        return lbp.astype(np.float32) / 255.0  # 归一化到0-1
