@@ -1,0 +1,55 @@
+import os
+import tifffile
+import torch
+from skimage import filters
+from torch.utils.data import Dataset
+
+
+class GreenSpaceDataset(Dataset):
+    def __init__(self, root_dir, is_train=True, stage=1):
+        """
+        初始化数据集：
+        - root_dir: 数据根目录
+        - is_train: 是否为训练集
+        - stage: 训练阶段（1 或 2）
+        """
+        self.image_dir = os.path.join(root_dir, "train/images" if is_train else "val/images")
+        self.label_dir = os.path.join(root_dir, "train/labels" if is_train else "val/labels")
+        self.image_files = sorted(os.listdir(self.image_dir))
+        self.stage = stage  # 训练阶段
+        self.is_train = is_train  # 保存is_train状态
+
+    def __len__(self):
+        return len(self.image_files)
+
+    def __getitem__(self, idx):
+        # 加载图像
+        img_path = os.path.join(self.image_dir, self.image_files[idx])
+        image = tifffile.imread(img_path).transpose(2, 0, 1)  # [C, H, W]
+        image = torch.from_numpy(image).float() / 255.0  # 归一化到 [0, 1]
+
+        # 加载标签
+        label_path = os.path.join(self.label_dir, self.image_files[idx].replace('.tif', '.tif'))
+        label = tifffile.imread(label_path)  # [H, W]
+        label = torch.from_numpy(label).long()
+        # 阶段一仅用前3通道（RGB），但保留NIR供阶段二使用
+        if self.stage == 1:
+            image = image[:3]  # [3, H, W]
+        # 阶段二使用全部4通道
+        elif self.stage == 2:
+            image = image  # [4, H, W]
+        # 处理标签
+        if self.stage == 1:
+            # 阶段一：二分类（背景 vs 植被）
+            label = (label > 0).long()  # 0=背景, 1=植被
+        elif self.stage == 2:
+            # 阶段二：三分类（保持原始标签值）
+            # 确保标签值在0-2范围内
+            label = torch.clamp(label, 0, 2)
+
+            # 验证标签值
+            unique_labels = torch.unique(label)
+            if not torch.all(torch.isin(unique_labels, torch.tensor([0, 1, 2]))):
+                raise ValueError(f"发现非法标签值: {unique_labels}. 只允许0(背景),1(绿地),2(其他植被)")
+
+        return image, label

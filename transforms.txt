@@ -1,0 +1,47 @@
+# ------------------- transforms.py -------------------
+import torch
+import torchvision.transforms.functional as F
+
+
+class MultiModalTransform:
+    def __init__(self, stage1_model, output_size=256, device="cpu"):
+        self.stage1_model = stage1_model.eval().to(device)
+        self.device = device
+
+    def __call__(self, image, label):
+        image = image.to(self.device)
+        if label is not None:
+            label = label.to(self.device)
+
+        # 数据增强
+        if torch.rand(1) < 0.5:
+            image = F.hflip(image)
+            if label is not None: label = F.hflip(label)
+        if torch.rand(1) < 0.5:
+            image = F.vflip(image)
+            if label is not None: label = F.vflip(label)
+        if torch.rand(1) < 0.5:
+            k = torch.randint(0, 4, (1,)).item()
+            image = torch.rot90(image, k, [1, 2])
+            if label is not None: label = torch.rot90(label, k, [0, 1])
+
+        # 多模态生成
+        with torch.no_grad():
+            stage1_probs = torch.softmax(self.stage1_model(image.unsqueeze(0)), dim=1)[0]
+        nir, red = image[3], image[0]
+        ndvi = (nir - red) / (nir + red + 1e-6)
+        pseudo_color = torch.stack([nir, red, image[1]], dim=0)
+
+        combined = torch.cat([image, pseudo_color, ndvi.unsqueeze(0), stage1_probs], dim=0)
+
+        # 标准化
+        mean = torch.tensor(
+            [0.485, 0.456, 0.406, 0.40] + [0.5] * 3 + [0.0] + [0.0] * 2,
+            device=self.device
+        ).view(10, 1, 1)
+        std = torch.tensor(
+            [0.229, 0.224, 0.225, 0.22] + [0.5] * 3 + [1.0] + [1.0] * 2,
+            device=self.device
+        ).view(10, 1, 1)
+
+        return (combined - mean) / std, label.cpu() if label is not None else None
