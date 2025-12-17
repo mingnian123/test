@@ -1,0 +1,116 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models import resnet50
+
+
+class EdgeAttention(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.edge_conv = nn.Sequential(
+            nn.Conv2d(in_channels, 64, 3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 1, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # 预定义Sobel核（固定权重，不训练）
+        sobel_kernel_x = torch.tensor(
+            [[[[1, 0, -1],
+               [2, 0, -2],
+               [1, 0, -1]]]],
+            dtype=torch.float32,
+            device=x.device
+        ).repeat(x.shape[1], 1, 1, 1)
+
+        sobel_kernel_y = torch.tensor(
+            [[[[1, 2, 1],
+               [0, 0, 0],
+               [-1, -2, -1]]]],
+            dtype=torch.float32,
+            device=x.device
+        ).repeat(x.shape[1], 1, 1, 1)
+
+        # 边缘检测
+        sobel_x = F.conv2d(x, sobel_kernel_x, padding=1, groups=x.shape[1])
+        sobel_y = F.conv2d(x, sobel_kernel_y, padding=1, groups=x.shape[1])
+        edge = torch.sqrt(sobel_x ** 2 + sobel_y ** 2 + 1e-6)  # 加小常数防NaN
+
+        return self.edge_conv(edge)
+
+class UpConvWithEdge(nn.Module):
+    """ 带边缘注意力的上采样模块 """
+
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.up_conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        )
+        self.edge_att = EdgeAttention(out_ch)
+
+    def forward(self, x):
+        x = self.up_conv(x)
+        edge_mask = self.edge_att(x)  # 生成边缘注意力
+        return x * (1 + edge_mask)  # 边缘区域增强
+
+
+class Stage2Segmenter(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        backbone = resnet50(pretrained=True)
+        # 修改输入通道为8（必须与config一致）
+        backbone.conv1 = nn.Conv2d(
+            8,  # 关键修改点
+            64,
+            kernel_size=7,
+            stride=2,
+            padding=3,
+            bias=False
+        )
+
+        self.encoder = nn.ModuleDict({
+            'layer0': nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu),
+            'layer1': nn.Sequential(backbone.maxpool, backbone.layer1),
+            'layer2': backbone.layer2,
+            'layer3': backbone.layer3,
+            'layer4': backbone.layer4
+        })
+
+        # 解码器部分
+        self.decoder = nn.ModuleDict({
+            'up4': UpConvWithEdge(2048, 1024),
+            'up3': UpConvWithEdge(1024 + 1024, 512),
+            'up2': UpConvWithEdge(512 + 512, 256),
+            'up1': UpConvWithEdge(256 + 256, 64)
+        })
+
+        # 最终输出层
+        self.final_conv = nn.Sequential(
+            nn.Conv2d(64, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.Conv2d(32, cfg.STAGE2["num_classes"], 1)
+        )
+
+    def forward(self, x):
+        # 编码器部分
+        x0 = self.encoder['layer0'](x)
+        x1 = self.encoder['layer1'](x0)
+        x2 = self.encoder['layer2'](x1)
+        x3 = self.encoder['layer3'](x2)
+        x4 = self.encoder['layer4'](x3)
+
+        # 解码器部分
+        d4 = self.decoder['up4'](x4)
+        d3 = self.decoder['up3'](torch.cat([d4, x3], 1))
+        d2 = self.decoder['up2'](torch.cat([d3, x2], 1))
+        d1 = self.decoder['up1'](torch.cat([d2, x1], 1))
+
+        # 最终输出
+        out = F.interpolate(d1, scale_factor=2, mode='bilinear', align_corners=False)
+        return self.final_conv(out)
